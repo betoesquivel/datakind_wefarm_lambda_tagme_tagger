@@ -3,6 +3,7 @@ import csv
 import itertools
 import requests
 import json
+import random
 
 # unicode csv reading
 def unicode_csv_dict_reader(unicode_csv_data, dialect=csv.excel, **kwargs):
@@ -55,13 +56,29 @@ def tag_nth_message(n):
 
 def tag_nth_message_in_reader(n, reader):
     msg = get_nth_from_iterable(n, reader)
-    return tagme_tag(msg['body'])
+    return [msg, tagme_tag(msg['body'])]
 
 def accum(vals, val):
     if vals:
         val -= (sum(map(lambda i: i + 1, vals)))
     vals.append(val)
     return vals
+
+# shuffle annotations before dynamo upload
+def roundrobin(*iterables):
+    from itertools import cycle, islice
+    pending = len(iterables)
+    nexts = cycle(iter(it).next for it in iterables)
+    while pending:
+        try:
+            for next in nexts:
+                yield next()
+        except StopIteration:
+            pending -= 1
+            nexts = cycle(islice(nexts, pending))
+
+def merge_annotation_with_msg_fields(a, msg):
+    return merge_dicts(a, {'full_text': msg['body'], 'message_id': msg['message_id']})
 
 def hello(event, context):
     jobs = event.get('n', [1])
@@ -71,6 +88,16 @@ def hello(event, context):
 
     jobs_accum = reduce(accum, jobs, [])
 
-    tagged = map(lambda j: tag_nth_message_in_reader(j, reader), jobs_accum)
+    msgs, tagged_msgs = zip(*map(lambda j: tag_nth_message_in_reader(j, reader), jobs_accum))
+    annotations_per_msg = [map(lambda a: merge_annotation_with_msg_fields(a, msg),
+                               tagged['annotations'])
+                           for msg, tagged in zip(msgs, tagged_msgs)]
 
-    return map(lambda ta: ta['raw'], tagged)
+    # Shuffle before writing to dynamo
+    shuffled_annotations = list(roundrobin(*annotations_per_msg))
+    shuffled_msgs = list(msgs)
+    random.shuffle(shuffled_msgs)
+
+    print type(shuffled_msgs[0]['message_id'])
+    print type(shuffled_annotations[0]['start'])
+    return [shuffled_annotations, shuffled_msgs]
