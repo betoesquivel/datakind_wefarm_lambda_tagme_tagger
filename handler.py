@@ -4,6 +4,42 @@ import itertools
 import requests
 import json
 import random
+from pprint import PrettyPrinter
+import uuid
+
+pp = PrettyPrinter()
+
+import boto3
+
+
+#SETTING UP THE QUEUE
+AWS_SQS_REGION = 'eu-west-1'
+sqs = boto3.resource('sqs')
+queue = sqs.get_queue_by_name(QueueName='tag_msg_jobs')
+
+
+# get db resource
+def get_resource():
+    resource = boto3.resource('dynamodb')
+    return resource
+dynamodb = get_resource()
+
+# get tables
+def get_table(table_name):
+    table_names = [t.name for t in dynamodb.tables.all()]
+    if table_name in table_names:
+        return dynamodb.Table(table_name)
+    else:
+        print("Table name doesn't exist")
+        return None
+annotations_table = get_table('datadive_wefarm_annotations')
+messages_table = get_table('datadive_wefarm_messages')
+
+# batch put items in their respective dynamo table
+def batch_put_items_in_table(items, table):
+    with table.batch_writer() as batch:
+        for item in items:
+            batch.put_item(Item=item)
 
 # unicode csv reading
 def unicode_csv_dict_reader(unicode_csv_data, dialect=csv.excel, **kwargs):
@@ -78,9 +114,16 @@ def roundrobin(*iterables):
             nexts = cycle(islice(nexts, pending))
 
 def merge_annotation_with_msg_fields(a, msg):
-    return merge_dicts(a, {'full_text': msg['body'], 'message_id': msg['message_id']})
+    categories = '|'.join(a['dbpedia_categories']) or "none"
+
+    return merge_dicts(a, {'full_text': msg['body'],
+                           'message_id': msg['message_id'],
+                           'dbpedia_categories': categories,
+                           'uuid': str(uuid.uuid1())})
+
 
 def hello(event, context):
+    # read the jobs from sqs
     jobs = event.get('n', [1])
     jobs.sort()
     csvfile = open('messages.csv', 'r')
@@ -98,6 +141,54 @@ def hello(event, context):
     shuffled_msgs = list(msgs)
     random.shuffle(shuffled_msgs)
 
-    print type(shuffled_msgs[0]['message_id'])
-    print type(shuffled_annotations[0]['start'])
+    print "Putting messages in table"
+    batch_put_items_in_table(shuffled_msgs, messages_table)
+    print "Finished with the  messages in table"
+
+    print "Putting annotations in table"
+    batch_put_items_in_table(shuffled_annotations, annotations_table)
+    print "Finished with the annotations in table"
+
+    # delete the jobs from sqs
+
+    return [shuffled_annotations, shuffled_msgs]
+
+def process(event, context):
+    queue_jobs = queue.receive_messages(
+        MaxNumberOfMessages=10,
+        WaitTimeSeconds=1
+    )
+    print "{} jobs read".format(len(queue_jobs))
+    jobs = [int(job.body) for job in queue_jobs]
+
+    jobs.sort()
+    csvfile = open('messages.csv', 'r')
+    reader = unicode_csv_dict_reader(csvfile)
+
+    jobs_accum = reduce(accum, jobs, [])
+
+    msgs, tagged_msgs = zip(*map(lambda j: tag_nth_message_in_reader(j, reader), jobs_accum))
+    annotations_per_msg = [map(lambda a: merge_annotation_with_msg_fields(a, msg),
+                               tagged['annotations'])
+                           for msg, tagged in zip(msgs, tagged_msgs)]
+
+    # Shuffle before writing to dynamo
+    shuffled_annotations = list(roundrobin(*annotations_per_msg))
+    shuffled_msgs = list(msgs)
+    random.shuffle(shuffled_msgs)
+
+    print "Putting messages in table"
+    batch_put_items_in_table(shuffled_msgs, messages_table)
+    print "Finished with the  messages in table"
+
+    print "Putting annotations in table"
+    batch_put_items_in_table(shuffled_annotations, annotations_table)
+    print "Finished with the annotations in table"
+
+    print "{} jobs proc".format(len(queue_jobs))
+    # delete the jobs from sqs
+    for job in queue_jobs:
+        job.delete()
+    print "{} jobs left".format(len(queue_jobs))
+
     return [shuffled_annotations, shuffled_msgs]

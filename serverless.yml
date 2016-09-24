@@ -48,6 +48,8 @@ package:
 functions:
   hello:
     handler: handler.hello
+  process:
+    handler: handler.process
 
 #   you can add any of the following events
 #   events:
