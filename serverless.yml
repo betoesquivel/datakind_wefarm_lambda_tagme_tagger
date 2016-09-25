@@ -46,8 +46,6 @@ package:
 #  artifact: my-service-code.zip
 
 functions:
-  hello:
-    handler: handler.hello
   process:
     handler: handler.process
 
